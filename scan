@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Defaults + environment overrides
+declare COLOR="${COLOR:-1}"
+declare DEVICE="${DEVICE:-imagescan:esci:usb:/sys/devices/pci0000:00/0000:00:14.0/usb1/1-9/1-9:1.0}"
+declare DOCUMENT_NAME="ocr.pdf"
+declare ORIENTATION="${ORIENTATION:-Portrait}"
+declare PAGE_SIZE="${PAGE_SIZE:-ISO/A4}"
+declare QUALITY="${QUALITY:-80}"
+declare RESOLUTION="${RESOLUTION:-300}"
+
+declare -r USAGE="USAGE: $(basename "$0") [OPTIONS] [NAME]
+
+Where NAME is the name of the pdf to output (default: $DOCUMENT_NAME)
+
+General options:
+
+  --help              Display this message
+
+Scan options:
+
+  --device NAME       SANE device name, as output by \`scanimage -L\`
+
+  --color             Scan colour documents (default)
+  --grayscale         Scan grayscale documents
+
+  --portrait          Scan portrait documents
+  --landscape         Scan landscape documents
+
+  --resolution DPI    Set the scan resolution
+
+Output options:
+
+  --quality PERCENT   Control the image compression (default: $QUALITY)
+                      Higher values reduce image compression but result in
+                      larger file sizes
+                      Lower values reduce image quality but produce lower
+                      file sizes
+"
+
+main() {
+    _parse_options "$@"
+
+    tmpdir=$(mktemp -d -t scan-XXXXXX)
+    echo "$tmpdir"
+
+    _scan "$tmpdir"
+    _ocr "$tmpdir"
+    _combine "$tmpdir"
+
+    rm -r "$tmpdir"
+}
+
+_parse_options() {
+    while [ -n "${1-}" ]; do
+        case "$1" in
+            --grayscale)
+                COLOR=0
+                ;;
+
+            --color)
+                COLOR=1
+                ;;
+
+            --device)
+                shift
+                DEVICE="$1"
+                ;;
+
+            --landscape)
+                shift
+                ORIENTATION=Landscape
+                ;;
+
+            --page-size)
+                shift
+                PAGE_SIZE="$1"
+                ;;
+
+            --portrait)
+                shift
+                ORIENTATION=Portrait
+                ;;
+
+            --resolution)
+                shift
+                RESOLUTION="$1"
+                ;;
+
+            --help)
+                printf "%s" "$USAGE"
+                exit
+                ;;
+
+            *)
+                DOCUMENT_NAME="$1"
+                break
+                ;;
+        esac
+        shift
+    done
+}
+
+# Scanning
+# ------------------------------------------------------------------------------
+
+_scan() {
+    dir="$1"
+
+    scanimage $(_scanimage_opts) --progress --batch="$dir/scan%d.pnm" --batch-prompt
+    _scan_postprocess "$dir"
+}
+
+# construct options for passing into scanimage(1)
+_scanimage_opts() {
+    # common scanimage options
+    echo --device-name "$DEVICE"
+    echo --format pnm
+
+    if [ "$COLOR" -eq 1 ]; then
+        echo "--mode Color"
+    else
+        echo "--mode Grayscale"
+    fi
+
+    # backend-specific options
+    case "$DEVICE" in
+        imagescan:*)
+            _IMAGESCAN_OPTS='--resolution %s --scan-area %s'
+            printf -- "$_IMAGESCAN_OPTS" "$RESOLUTION" "$PAGE_SIZE/$ORIENTATION"
+            ;;
+    esac
+}
+
+# image processing that should apply to further steps
+# (e.g. skew, crop, basic image cleanup)
+_scan_postprocess() {
+    dir="$1"
+
+    for image in "$dir"/scan*.pnm; do
+        num="$(_filenumber "$image")"
+        convert "$image" $(_scan_postprocess_magick_opts) "$dir/scan$num-cleaned.pnm"
+    done
+}
+
+_scan_postprocess_magick_opts() {
+    echo -deskew 40%
+    echo -despeckle
+}
+
+# OCR
+# ------------------------------------------------------------------------------
+
+_ocr() {
+    dir="$1"
+
+    _ocr_preprocess "$dir"
+
+    for image in "$dir"/ocr-input*; do
+        num="$(_filenumber "$image")"
+        tesseract "$image" "$dir/text$num" --dpi "$RESOLUTION" -l eng -c textonly_pdf=1 pdf
+    done
+}
+
+# aggressive image processing before running ocr
+# convert to black and white, reduce artifacts, etc.
+_ocr_preprocess() {
+    dir="$1"
+
+    for image in "$dir"/scan*-cleaned.pnm; do
+        num="$(_filenumber "$image")"
+        convert "$image" $(_ocr_preprocess_magick_opts) "$dir/ocr-input$num.pnm"
+    done
+}
+
+_ocr_preprocess_magick_opts() {
+    echo -colorspace Gray
+
+    echo -fuzz 10%
+    echo -blur 1x65536
+    echo -sharpen 0x1
+
+    echo -threshold 50%
+    echo -contrast-stretch 0
+}
+
+# Combine
+# ------------------------------------------------------------------------------
+
+# generate final pdf combining the image and text layers
+_combine() {
+    dir="$1"
+
+    _image_preprocess "$dir"
+
+    for image in "$dir/"image*.pdf; do
+        num="$(_filenumber "$image")"
+        qpdf "$image" --overlay "$dir/text$num.pdf" -- "$dir/combined$num.pdf"
+    done
+
+    qpdf --empty "$DOCUMENT_NAME" --pages "$dir"/combined*.pdf --
+}
+
+# apply image processing to control the visual appearance of the output
+# downscales output resolution, applies compression
+_image_preprocess() {
+    dir="$1"
+
+    for image in "$dir"/scan*-cleaned.pnm; do
+        num="$(_filenumber "$image")"
+        convert "$image" $(_image_preprocess_magick_opts) "$dir/image$num.pdf"
+    done
+}
+
+_image_preprocess_magick_opts() {
+    if [ "$COLOR" -ne 1 ]; then
+        echo -colorspace Gray
+    fi
+
+    echo -fuzz 5%
+    echo -blur 1x65536
+    echo -sharpen 0x1
+
+    # drop dpi based on desired quality
+    echo -density "${RESOLUTION}x${RESOLUTION}"
+    if [ "$QUALITY" -ge 90 ]; then
+        :
+    elif [ "$QUALITY" -ge 70 ]; then
+        echo -resample 150x150
+    else
+        echo -resample 72x72
+    fi
+
+    echo -quality "$QUALITY"
+
+    echo -compress jpeg
+}
+
+# Utilities
+# ------------------------------------------------------------------------------
+
+_filenumber() {
+    basename "$1" | egrep -o '[0-9]+' | head -1
+}
+
+main "$@"
