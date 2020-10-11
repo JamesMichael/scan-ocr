@@ -25,6 +25,9 @@ Scan options:
   --color             Scan colour documents (default)
   --grayscale         Scan grayscale documents
 
+  --a4                Set paper size to A4 (default)
+  --a5                Set paper size to A5
+
   --portrait          Scan portrait documents
   --landscape         Scan landscape documents
 
@@ -55,6 +58,14 @@ main() {
 _parse_options() {
     while [ -n "${1-}" ]; do
         case "$1" in
+            --a4)
+                PAGE_SIZE=ISO/A4
+                ;;
+
+            --a5)
+                PAGE_SIZE=ISO/A5
+                ;;
+
             --grayscale)
                 COLOR=0
                 ;;
